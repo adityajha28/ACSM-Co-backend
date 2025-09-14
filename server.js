@@ -1,104 +1,109 @@
-// server/server.js
-require("dotenv").config();
-const express = require("express");
-const nodemailer = require("nodemailer");
-const cors = require("cors");
-const rateLimit = require("express-rate-limit");
-const helmet = require("helmet");
+import express from "express";
+import nodemailer from "nodemailer";
+import rateLimit from "express-rate-limit";
+import helmet from "helmet";
+import cors from "cors";
+import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// ====== Middleware ======
 app.use(helmet());
 app.use(express.json());
 
-const allowedOrigin = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
-app.use(cors({ origin: allowedOrigin }));
-
 const limiter = rateLimit({
-  windowMs: 1000 * 60 * 60, // 1 hr
+  windowMs: 1000 * 60 * 60,
   max: 200,
   message: { success: false, error: "Too many requests, try again later." },
 });
 app.use(limiter);
 
-function validatePayload(body) {
-  const { name, organization, contactNo } = body;
-  if (!name || !name.trim()) return "Name is required";
-  if (!organization || !organization.trim()) return "Organization name is required";
-  if (!contactNo || !contactNo.trim()) return "Contact number is required";
-  if (!/^[0-9+\-\s()]{7,20}$/.test(contactNo.trim())) return "Invalid contact number";
-  return null;
+// ====== AWS Secrets Manager setup ======
+const SECRET_NAME = "acsm/backend/smtp"; // change to your secret name
+const client = new SecretsManagerClient({ region: "ap-south-1" });
+
+let smtpConfig = {};
+let transporter;
+
+async function loadSecrets() {
+  try {
+    const response = await client.send(
+      new GetSecretValueCommand({
+        SecretId: SECRET_NAME,
+        VersionStage: "AWSCURRENT",
+      })
+    );
+
+    smtpConfig = JSON.parse(response.SecretString);
+    console.log("✅ Secrets loaded from AWS Secrets Manager");
+  } catch (err) {
+    console.error("❌ Failed to load secrets:", err);
+    process.exit(1); // exit if secrets cannot be loaded
+  }
 }
 
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT || 465),
-  secure: process.env.SMTP_SECURE === "true",
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-});
+async function initTransporter() {
+  await loadSecrets();
 
-transporter.verify((err) => {
-  if (err) console.warn("Mail transporter not ready:", err.message);
-  else console.log("Mail transporter ready");
-});
+  transporter = nodemailer.createTransport({
+    host: smtpConfig.SMTP_HOST,
+    port: Number(smtpConfig.SMTP_PORT || 465),
+    secure: smtpConfig.SMTP_SECURE === "true",
+    auth: {
+      user: smtpConfig.SMTP_USER,
+      pass: smtpConfig.SMTP_PASS,
+    },
+  });
 
-// 🔹 Health check endpoint
+  transporter.verify((err) => {
+    if (err) console.warn("❌ Mail transporter not ready:", err.message);
+    else console.log("✅ Mail transporter ready");
+  });
+
+  // ====== CORS setup after secrets load ======
+  const allowedOrigin = smtpConfig.FRONTEND_ORIGIN || "http://localhost:5173";
+  app.use(cors({ origin: allowedOrigin }));
+
+  // ====== Start server ======
+  app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+}
+
+// ====== Routes ======
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
-// 🔹 Single reusable endpoint
 app.post("/api/callback", async (req, res) => {
   try {
-    const payload = req.body;
-    const err = validatePayload(payload);
-    if (err) return res.status(400).json({ success: false, error: err });
+    if (!transporter) return res.status(500).json({ success: false, error: "Mail not ready" });
 
-    const name = payload.name.trim();
-    const org = payload.organization.trim();
-    const contactNo = payload.contactNo.trim();
-    const email = payload.email?.trim() || "Not provided";
-    const message = payload.message?.trim() || "Not provided";
-    const source = payload.source?.trim() || "Unknown Page";
+    const { name, organization, contactNo, email, message, source } = req.body;
 
     const html = `
-      <h2>New Callback Request (${source})</h2>
+      <h2>New Callback Request (${source || "Unknown Page"})</h2>
       <table cellpadding="6">
-        <tr><td><strong>Name:</strong></td><td>${escapeHtml(name)}</td></tr>
-        <tr><td><strong>Organization:</strong></td><td>${escapeHtml(org)}</td></tr>
-        <tr><td><strong>Contact No.:</strong></td><td>${escapeHtml(contactNo)}</td></tr>
-        <tr><td><strong>Email:</strong></td><td>${escapeHtml(email)}</td></tr>
-        <tr><td><strong>Message:</strong></td><td>${escapeHtml(message)}</td></tr>
+        <tr><td><strong>Name:</strong></td><td>${name?.trim() || "N/A"}</td></tr>
+        <tr><td><strong>Organization:</strong></td><td>${organization?.trim() || "N/A"}</td></tr>
+        <tr><td><strong>Contact No.:</strong></td><td>${contactNo?.trim() || "N/A"}</td></tr>
+        <tr><td><strong>Email:</strong></td><td>${email?.trim() || "N/A"}</td></tr>
+        <tr><td><strong>Message:</strong></td><td>${message?.trim() || "N/A"}</td></tr>
       </table>
-      <p><strong>Source:</strong> ${escapeHtml(source)}</p>
+      <p><strong>Source:</strong> ${source || "Unknown Page"}</p>
       <p>Received at ${new Date().toLocaleString()}</p>
     `;
 
-    const mailOptions = {
-      from: `"Website Callback" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`,
-      to: process.env.CONTACT_RECEIVER_EMAIL,
-      subject: `Callback Request (${source}) — ${name}`,
+    await transporter.sendMail({
+      from: `"Website Callback" <${smtpConfig.SMTP_FROM || smtpConfig.SMTP_USER}>`,
+      to: smtpConfig.CONTACT_RECEIVER_EMAIL,
+      subject: `Callback Request (${source || "Unknown"}) — ${name || "N/A"}`,
       html,
-    };
+    });
 
-    await transporter.sendMail(mailOptions);
     res.json({ success: true });
-  } catch (e) {
-    console.error("Callback mail error:", e);
+  } catch (err) {
+    console.error("Callback mail error:", err);
     res.status(500).json({ success: false, error: "Internal server error" });
   }
 });
 
-function escapeHtml(text) {
-  return text
-    ? text.replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;")
-          .replace(/"/g, "&quot;")
-          .replace(/'/g, "&#039;")
-    : "";
-}
-
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// ====== Initialize ======
+initTransporter();

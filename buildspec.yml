@@ -2,7 +2,7 @@ version: 0.2
 
 env:
   variables:
-    ECR_REPO_NAME: backend
+    ECR_REPO_NAME: acsm/backend
 phases:
   pre_build:
     commands:
@@ -20,7 +20,7 @@ phases:
     commands:
       - echo "Pushing the Docker image..."
       - docker push $REPOSITORY_URI:$IMAGE_TAG
-      - printf '[{"name":"backend","imageUri":"%s"}]' $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
+      - printf '[{"name":"acsmbackend","imageUri":"%s"}]' $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
 artifacts:
   files:
     - imagedefinitions.json
